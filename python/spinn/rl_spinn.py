@@ -262,7 +262,10 @@ class BaseModel(_BaseModel):
         if self.rl_valid:
             t_mask = np.logical_and(t_mask, t_valid_mask)
 
-        batch_size = advantage.size(0)
+        if self.use_sentence_pair:
+            batch_size = advantage.size(0) * 2
+        else:
+            batch_size = advantage.size(0)
 
         seq_length = t_preds.shape[0] / batch_size
 
@@ -285,22 +288,25 @@ class BaseModel(_BaseModel):
             # sentences.
             advantage = torch.cat([advantage, advantage], 0)
 
-        # Expand advantage.
-        advantage = torch.index_select(advantage, 0, a_index)
+        # Preemptively multiply every logprob by the advantage.
+        t_logprobs_r = t_logprobs.view(batch_size, seq_length, -1) * to_gpu(Variable(advantage.view(batch_size, 1, 1),
+            volatile=not self.training))
+        t_logprobs_r = t_logprobs_r.view(-1, 2)
 
-        # Filter logits.
-        t_logprobs = torch.index_select(t_logprobs, 0, t_index)
+        # Select the relevant logprob based on the action (t_pred). Set skipped actions to 0
+        # as they will be dropped anyway.
+        t_preds_tensor = torch.from_numpy(t_preds).long()
+        t_preds_tensor[t_preds_tensor == 2] = 0
+        select_t_logsprob_r = torch.gather(t_logprobs_r, 1, to_gpu(Variable(t_preds_tensor.view(-1, 1),
+            volatile=not self.training)))
 
-        actions = to_gpu(Variable(torch.from_numpy(
-            t_preds[t_mask]).long().view(-1, 1), volatile=not self.training))
-        log_p_action = torch.gather(t_logprobs, 1, actions)
+        # Select only the relevant actions.
+        t_mask_tensor = to_gpu(Variable(torch.from_numpy(t_mask.astype(np.uint8)).byte(),
+            volatile=not self.training))
+        select_t_logsprob_r = select_t_logsprob_r[t_mask_tensor.view(-1, 1)]
 
-        # NOTE: Not sure I understand why entropy is inside this
-        # multiplication. Investigate?
-        policy_losses = log_p_action.view(-1) * \
-            to_gpu(Variable(advantage, volatile=log_p_action.volatile))
-        policy_loss = -1. * torch.sum(policy_losses)
-        policy_loss /= log_p_action.size(0)
+        policy_loss = -1. * torch.sum(select_t_logsprob_r)
+        policy_loss /= select_t_logsprob_r.size(0)
         policy_loss *= self.rl_weight
 
         return policy_loss
